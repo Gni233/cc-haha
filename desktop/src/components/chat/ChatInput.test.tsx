@@ -116,6 +116,7 @@ import { useTabStore } from '../../stores/tabStore'
 import { useWorkspaceChatContextStore } from '../../stores/workspaceChatContextStore'
 import { useWorkflowStore } from '../../stores/workflowStore'
 import { workflowsApi } from '../../api/workflows'
+import { computerUseApi } from '../../api/computerUse'
 import { browserHost } from '../../lib/desktopHost/browserHost'
 import { settingsApi } from '../../api/settings'
 import {
@@ -725,6 +726,98 @@ describe('ChatInput file mentions', () => {
     const guidedMessages = useChatStore.getState().sessions[sessionId]?.messages
       .filter((message) => message.type === 'user_text' && message.content === 'please adjust the current direction')
     expect(guidedMessages).toHaveLength(1)
+  })
+
+  describe('while a question is waiting for an answer', () => {
+    /**
+     * The model is blocked inside the AskUserQuestion tool call, so nothing typed
+     * here can reach it until the question resolves. Letting the composer take a
+     * message anyway reads as "I already replied" and is how questions get
+     * abandoned — the card is the only way forward.
+     */
+    const setQuestionPending = (pending: boolean) => {
+      act(() => {
+        useChatStore.setState((state) => ({
+          sessions: {
+            ...state.sessions,
+            [sessionId]: {
+              ...state.sessions[sessionId]!,
+              chatState: pending ? 'permission_pending' : 'idle',
+              pendingPermission: pending
+                ? {
+                    requestId: 'ask-1',
+                    toolName: 'AskUserQuestion',
+                    toolUseId: 'question-1',
+                    input: {},
+                  }
+                : null,
+            },
+          },
+        }))
+      })
+    }
+
+    // The assertion is made without dispatching any transaction: `editable` is
+    // only re-read when ProseMirror updates the view, so a disabled flip with no
+    // document change used to leave the editor typing-editable.
+    it('locks the composer and explains why', () => {
+      setQuestionPending(true)
+
+      render(<ChatInput compact />)
+
+      expect(getComposerElement()).toHaveAttribute('contenteditable', 'false')
+      expect(getComposerElement()).toHaveAttribute(
+        'data-placeholder',
+        'Answer the question above first — Claude is waiting on it.',
+      )
+    })
+
+    it('drops a submit instead of queueing it behind the question', () => {
+      setQuestionPending(true)
+
+      render(<ChatInput compact />)
+
+      setComposerText('never mind, do it the other way', 32)
+      fireEvent.keyDown(getComposerElement(), { key: 'Enter' })
+
+      expect(mocks.wsSend).not.toHaveBeenCalledWith(sessionId, expect.objectContaining({
+        type: 'user_message',
+      }))
+      expect(useChatStore.getState().sessions[sessionId]?.queuedUserMessages ?? []).toEqual([])
+      expect(screen.queryByTestId('pending-user-message')).not.toBeInTheDocument()
+    })
+
+    it('blocks "Guide now" until the question is gone', () => {
+      setQuestionPending(true)
+      useChatStore.getState().queueUserMessage(sessionId, {
+        content: 'queued while the question was up',
+        displayContent: 'queued while the question was up',
+      })
+
+      render(<ChatInput compact />)
+
+      expect(screen.getByRole('button', { name: /Guide now/i })).toHaveProperty('disabled', true)
+
+      setQuestionPending(false)
+
+      expect(screen.getByRole('button', { name: /Guide now/i })).toHaveProperty('disabled', false)
+    })
+
+    it('unlocks once the question is answered or stopped', () => {
+      setQuestionPending(true)
+
+      render(<ChatInput compact />)
+
+      expect(getComposerElement()).toHaveAttribute('contenteditable', 'false')
+
+      setQuestionPending(false)
+
+      expect(getComposerElement()).toHaveAttribute('contenteditable', 'true')
+      expect(getComposerElement()).toHaveAttribute(
+        'data-placeholder',
+        'Ask Claude to edit, debug or explain...',
+      )
+    })
   })
 
   it('edits and deletes queued prompts without sending them', async () => {
@@ -1436,6 +1529,52 @@ describe('ChatInput file mentions', () => {
     })
   })
 
+  it('seeds the launch draft from the project root when the empty session sits in a stale worktree', async () => {
+    useSessionStore.setState({
+      sessions: [{
+        id: sessionId,
+        title: 'Project',
+        createdAt: '2026-05-01T00:00:00.000Z',
+        modifiedAt: '2026-05-01T00:00:00.000Z',
+        messageCount: 0,
+        projectPath: '/repo',
+        projectRoot: '/repo',
+        workDir: '/repo/.claude/worktrees/desktop-main-12345678',
+        workDirExists: true,
+      }],
+      activeSessionId: sessionId,
+    })
+    useChatStore.setState({
+      sessions: {
+        [sessionId]: {
+          messages: [],
+          chatState: 'idle',
+          connectionState: 'connected',
+          streamingText: '',
+          streamingToolInput: '',
+          activeToolUseId: null,
+          activeToolName: null,
+          activeThinkingId: null,
+          pendingPermission: null,
+          pendingComputerUsePermission: null,
+          tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
+          elapsedSeconds: 0,
+          statusVerb: '',
+          slashCommands: [],
+          agentTaskNotifications: {},
+          elapsedTimer: null,
+        },
+      },
+    })
+
+    render(<ChatInput variant="hero" />)
+
+    await waitFor(() => {
+      expect(useChatStore.getState().sessions[sessionId]?.repositoryLaunchDraft?.workDir).toBe('/repo')
+    })
+  })
+
   it('starts an empty active session on the selected branch inside an isolated worktree', async () => {
     mocks.create.mockResolvedValueOnce({
       sessionId: 'created-worktree',
@@ -1721,6 +1860,63 @@ describe('ChatInput file mentions', () => {
     expect(mocks.wsSend).toHaveBeenCalledWith(sessionId, {
       type: 'user_message', content: 'Use the Skill tool with skill: "team:review" for this request.', attachments: [],
     })
+  })
+
+  it('inserts a skill mention badge from the capability menu', async () => {
+    mocks.listReferences.mockResolvedValue({ plugins: [], skills: [{
+      kind: 'skill', id: 'design', name: 'design', displayName: 'Design',
+      description: 'Create interfaces', source: 'user', modelText: 'Use the Skill tool with skill: "design" for this request.',
+    }] })
+    render(<ChatInput compact />)
+
+    fireEvent.click(screen.getByLabelText('Open composer tools'))
+    fireEvent.click(await screen.findByRole('option', { name: /^Skills/ }))
+    fireEvent.click(await screen.findByRole('option', { name: /Design/ }))
+
+    await waitFor(() => expect(document.querySelector('[data-mention-kind="skill"]')).toBeInTheDocument())
+    expect(mocks.wsSend).not.toHaveBeenCalled()
+    fireEvent.keyDown(getComposerElement(), { key: 'Enter' })
+    expect(mocks.wsSend).toHaveBeenCalledWith(sessionId, {
+      type: 'user_message', content: 'Use the Skill tool with skill: "design" for this request.', attachments: [],
+    })
+  })
+
+  it('inserts /agent text from the capability menu without sending', async () => {
+    mocks.listAgents.mockResolvedValue({
+      activeAgents: [{ agentType: 'debugger', description: 'Debug failures', source: 'userSettings', isActive: true }],
+      allAgents: [],
+    })
+    render(<ChatInput compact />)
+
+    fireEvent.click(screen.getByLabelText('Open composer tools'))
+    fireEvent.click(await screen.findByRole('option', { name: /^Agents/ }))
+    fireEvent.click(await screen.findByRole('option', { name: /debugger/ }))
+
+    await waitFor(() => expect(getComposerText()).toBe('/agent debugger '))
+    expect(mocks.wsSend).not.toHaveBeenCalled()
+  })
+
+  it('toggles Computer Use from the capability menu with a rollback on failure', async () => {
+    const getStatus = vi.spyOn(computerUseApi, 'getStatus').mockResolvedValue({
+      supported: true,
+    } as Awaited<ReturnType<typeof computerUseApi.getStatus>>)
+    vi.spyOn(computerUseApi, 'getAuthorizedApps').mockResolvedValue({
+      enabled: false,
+      authorizedApps: [],
+      grantFlags: { clipboardRead: false, clipboardWrite: false, systemKeyCombos: false },
+      pythonPath: null,
+    })
+    const setAuthorizedApps = vi.spyOn(computerUseApi, 'setAuthorizedApps').mockResolvedValue({ ok: true })
+    render(<ChatInput compact />)
+
+    fireEvent.click(screen.getByLabelText('Open composer tools'))
+    const row = await screen.findByRole('menuitemcheckbox', { name: /Computer Use/ })
+    await waitFor(() => expect(row).toHaveAttribute('aria-checked', 'false'))
+
+    fireEvent.click(row.querySelector('input[type="checkbox"]')!)
+    await waitFor(() => expect(setAuthorizedApps).toHaveBeenCalledWith({ enabled: true }))
+    await waitFor(() => expect(row).toHaveAttribute('aria-checked', 'true'))
+    expect(getStatus).toHaveBeenCalled()
   })
 
   it('inserts a selected @ file as an inline mention pill and sends its absolute path', async () => {
@@ -2269,6 +2465,23 @@ describe('ChatInput file mentions', () => {
     render(<ChatInput compact />)
 
     expect(screen.getByTestId('chat-input-toolbar')).toHaveClass('-mx-3')
+  })
+
+  // The hero row is `flex`, and a paragraph holding an unbreakable run (a
+  // long URL, a hash) has a huge min-content size that `overflow-wrap:
+  // break-word` does not shrink. Without `min-w-0` the flex item refuses to
+  // shrink below it, so the whole editor grows past the panel's right border
+  // and every line stops wrapping at the panel edge.
+  it('keeps min-w-0 on the hero composer wrapper so unbreakable runs cannot widen it', async () => {
+    render(<ChatInput variant="hero" />)
+
+    await waitFor(() => {
+      expect(mocks.getGitInfo).toHaveBeenCalledWith(sessionId)
+    })
+
+    const wrapper = getComposerElement().parentElement
+    expect(wrapper).toHaveClass('flex-1')
+    expect(wrapper).toHaveClass('min-w-0')
   })
 
   it('uses Shift+Enter for a newline when Enter is the configured send shortcut', async () => {

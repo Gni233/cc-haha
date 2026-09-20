@@ -273,32 +273,6 @@ export class ConversationStartupError extends Error {
   }
 }
 
-export type ConversationControlErrorCode =
-  | 'not_found'
-  | 'not_running'
-  | 'unsupported_type'
-
-export class ConversationControlError extends Error {
-  constructor(
-    message: string,
-    readonly code?: ConversationControlErrorCode,
-  ) {
-    super(message)
-    this.name = 'ConversationControlError'
-  }
-}
-
-function classifyControlError(
-  request: Record<string, unknown>,
-  message: string,
-): ConversationControlErrorCode | undefined {
-  if (request.subtype !== 'stop_task') return undefined
-  if (message.startsWith('No task found with ID:')) return 'not_found'
-  if (/^Task .+ is not running \(status: .+\)$/.test(message)) return 'not_running'
-  if (message.startsWith('Unsupported task type:')) return 'unsupported_type'
-  return undefined
-}
-
 export class ConversationService {
   private sessions = new Map<string, SessionProcess>()
   private deletedSessions = new Set<string>()
@@ -839,6 +813,27 @@ export class ConversationService {
     return true
   }
 
+  getPendingPermissionToolName(sessionId: string, requestId: string): string | undefined {
+    return this.sessions.get(sessionId)?.pendingPermissionRequests.get(requestId)?.toolName
+  }
+
+  /**
+   * In-process main-loop model switch via the SDK set_model control request.
+   * Only the model name changes — provider env is fixed at process spawn, so
+   * this is only valid when the target model belongs to the session's current
+   * provider. The ack resolves before the CLI's next API request is built, so
+   * sending this while the CLI is blocked on a permission decision is
+   * race-free (unlike sending it after the allow response).
+   */
+  async setModel(sessionId: string, model: string, timeoutMs = 10_000): Promise<boolean> {
+    if (!this.sessions.has(sessionId)) return false
+    await this.requestControl(sessionId, {
+      subtype: 'set_model',
+      model,
+    }, timeoutMs)
+    return this.sessions.has(sessionId)
+  }
+
   setMaxThinkingTokens(sessionId: string, maxThinkingTokens: number | null): boolean {
     return this.sendSdkMessage(sessionId, {
       type: 'control_request',
@@ -942,11 +937,7 @@ export class ConversationService {
         }
 
         if (msg.response.subtype === 'error') {
-          const message = String(msg.response.error || 'Control request failed')
-          finish(() => reject(new ConversationControlError(
-            message,
-            classifyControlError(request, message),
-          )))
+          finish(() => reject(new Error(String(msg.response.error || 'Control request failed'))))
           return
         }
 

@@ -178,7 +178,8 @@ describe('composerUtils', () => {
   it('opens on the commands the desktop owns instead of the CLI registration order', () => {
     // The CLI lists its bundled skills first, so an unprioritised menu opens on
     // `update-config` / `debug` / `batch`. Desktop-owned commands lead instead,
-    // and everything else keeps the order its source gave it.
+    // and everything else keeps the order its source gave it. `help` has a
+    // permanent GUI home, so it stays out of the empty-query listing.
     const commands = [
       { name: 'update-config', description: 'Configure' },
       { name: 'debug', description: 'Debug' },
@@ -187,12 +188,36 @@ describe('composerUtils', () => {
       { name: 'model', description: 'Switch AI model' },
     ]
     expect(filterSlashCommands(commands, '').map((command) => command.name)).toEqual([
-      'help',
       'model',
       'update-config',
       'debug',
       'compact',
     ])
+  })
+
+  it('hides commands with a permanent GUI home from the empty-query listing only', () => {
+    const all = mergeSlashCommands([])
+    const emptyQueryNames = filterSlashCommands(all, '').map((command) => command.name)
+
+    for (const hidden of ['status', 'cost', 'context', 'config', 'doctor', 'memory', 'plugin', 'help', 'plugins', 'settings']) {
+      expect(emptyQueryNames).not.toContain(hidden)
+    }
+    // Everything the desktop still surfaces in the menu is untouched.
+    for (const visible of ['mcp', 'skills', 'save-workflow', 'model', 'compact']) {
+      expect(emptyQueryNames).toContain(visible)
+    }
+
+    // Typing the name still matches — and still resolves to the same UI action.
+    expect(filterSlashCommands(all, 'status').map((command) => command.name)).toContain('status')
+    expect(filterSlashCommands(all, 'conf').map((command) => command.name)).toContain('config')
+  })
+
+  it('hides CLI-reported commands by name too, regardless of source', () => {
+    const cliReported = [{ name: 'status', description: 'CLI status', kind: 'command' as const }]
+    const emptyQueryNames = filterSlashCommands(mergeSlashCommands(cliReported), '').map(
+      (command) => command.name,
+    )
+    expect(emptyQueryNames).not.toContain('status')
   })
 
   it('leaves match ranking alone once a query is typed', () => {

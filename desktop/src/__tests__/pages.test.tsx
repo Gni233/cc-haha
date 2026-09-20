@@ -150,11 +150,16 @@ describe('Content-only pages render without errors', () => {
     expect(await screen.findByText('lark-mail')).toBeInTheDocument()
     expect(screen.getByText('mcp')).toBeInTheDocument()
     expect(screen.getByText('skills')).toBeInTheDocument()
-    expect(screen.getByText('help')).toBeInTheDocument()
-    expect(screen.getByText('plugin')).toBeInTheDocument()
-    expect(screen.getByText('context')).toBeInTheDocument()
+    // Commands with a permanent GUI home stay out of the empty-query listing…
+    expect(screen.queryByText('help')).not.toBeInTheDocument()
+    expect(screen.queryByText('plugin')).not.toBeInTheDocument()
+    expect(screen.queryByText('context')).not.toBeInTheDocument()
     expect(screen.queryByText('plugins')).not.toBeInTheDocument()
     expect(screen.queryByText('internal-only')).not.toBeInTheDocument()
+
+    // …but typing the name still matches them.
+    setComposerText('/help', 5)
+    expect(await screen.findByText('help')).toBeInTheDocument()
   })
 
   it('EmptySession shows /goal as one command with argument hints, not pseudo subcommands', async () => {

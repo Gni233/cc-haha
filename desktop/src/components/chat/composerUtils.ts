@@ -64,6 +64,28 @@ export const SLASH_COMMAND_ALIASES = [
 ] as const
 
 /**
+ * Desktop-owned commands that duplicate a permanent GUI surface and so stay
+ * out of the slash menu's *default* (empty-query) listing: status/cost/context
+ * live on the toolbar's ContextUsageIndicator, config/doctor/memory/plugin are
+ * Settings tabs, and help is superseded by the composer's capability menu.
+ * They are only hidden from the empty-query view — typing the name still
+ * matches and executes them exactly as before, and the commands remain
+ * registered for `getSlashCommandNameConflict`. Aliases of hidden commands
+ * are hidden too so `plugins`/`settings` don't leak their targets back in.
+ */
+export const DEFAULT_HIDDEN_SLASH_COMMAND_NAMES: ReadonlySet<string> = new Set([
+  'status',
+  'cost',
+  'context',
+  'config',
+  'doctor',
+  'memory',
+  'plugin',
+  'help',
+  ...SLASH_COMMAND_ALIASES.map(alias => alias.name),
+])
+
+/**
  * Commands the desktop owns, in the order the slash menu should lead with them.
  * The order is the one the panel and settings tables declare, so the first
  * screen stays the same no matter how the CLI happened to register its list.
@@ -357,7 +379,15 @@ export function filterSlashCommands(
   const normalized = filter.toLowerCase()
   // No query yet: this is the order the menu opens on, so lead with the
   // commands the desktop owns instead of whatever the CLI registered first.
-  if (!normalized.trim()) return prioritizeSlashCommands([...commands])
+  // Commands with a permanent GUI home (status/cost/context/…) stay hidden
+  // until the user types — see DEFAULT_HIDDEN_SLASH_COMMAND_NAMES.
+  if (!normalized.trim()) {
+    return prioritizeSlashCommands(
+      [...commands].filter(
+        command => !DEFAULT_HIDDEN_SLASH_COMMAND_NAMES.has(command.name.trim().toLowerCase()),
+      ),
+    )
+  }
 
   return commands
     .map((command, index) => ({

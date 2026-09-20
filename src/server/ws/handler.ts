@@ -16,9 +16,9 @@ import type {
   TurnTiming,
 } from './events.js'
 import { RUNTIME_CONFIG_APPLIED_EVENT } from './events.js'
+import { PLAN_EXECUTION_CONTINUE_MESSAGE } from '../../constants/messages.js'
 import * as os from 'node:os'
 import {
-  ConversationControlError,
   ConversationStartupError,
   conversationService,
 } from '../services/conversationService.js'
@@ -1353,10 +1353,12 @@ async function handlePrewarmSession(ws: ServerWebSocket<WebSocketData>) {
     })
 }
 
-function handlePermissionResponse(
+const EXIT_PLAN_MODE_TOOL_NAME = 'ExitPlanMode'
+
+function finalizePermissionResponse(
   ws: ServerWebSocket<WebSocketData>,
-  message: Extract<ClientMessage, { type: 'permission_response' }>
-) {
+  message: Extract<ClientMessage, { type: 'permission_response' }>,
+): void {
   const { sessionId } = ws.data
   const resolved = conversationService.respondToPermission(
     sessionId,
@@ -1376,6 +1378,175 @@ function handlePermissionResponse(
     })
   }
   console.log(`[WS] Permission response for ${message.requestId}: ${message.allowed}`)
+}
+
+function handlePermissionResponse(
+  ws: ServerWebSocket<WebSocketData>,
+  message: Extract<ClientMessage, { type: 'permission_response' }>
+) {
+  const { sessionId } = ws.data
+  if (
+    message.allowed &&
+    message.runtimeOverride &&
+    conversationService.getPendingPermissionToolName(sessionId, message.requestId) ===
+      EXIT_PLAN_MODE_TOOL_NAME
+  ) {
+    void handlePlanApprovalWithRuntimeOverride(ws, message).catch((err) => {
+      // The approval was NOT sent: the CLI is still waiting on the permission
+      // and the user can retry. Note the desktop optimistically dismissed the
+      // approval bar on send — it reappears on the reconnect replay.
+      console.error(`[WS] Plan approval with runtime override failed for ${sessionId}:`, err)
+      sendMessage(ws, {
+        type: 'error',
+        message: 'Failed to apply the execution model. The plan is still waiting for approval.',
+        code: 'RUNTIME_CONFIG_INVALID',
+      })
+    })
+    return
+  }
+  finalizePermissionResponse(ws, message)
+}
+
+/**
+ * Extract the session-scoped setMode entry a plan approval may carry, so the
+ * approved mode is persisted before the runtime restart reads it back via
+ * getRuntimeSettings — the CLI's own status broadcast → persist round-trip can
+ * lose the race against our interrupt → restart sequence.
+ */
+function extractSessionModeUpdate(
+  permissionUpdates: unknown[] | undefined,
+): PermissionMode | undefined {
+  if (!Array.isArray(permissionUpdates)) return undefined
+  for (const update of permissionUpdates) {
+    if (!update || typeof update !== 'object') continue
+    const candidate = update as { type?: unknown; destination?: unknown; mode?: unknown }
+    if (
+      candidate.type === 'setMode' &&
+      candidate.destination === 'session' &&
+      isPermissionMode(candidate.mode)
+    ) {
+      return candidate.mode
+    }
+  }
+  return undefined
+}
+
+function waitForTurnResultOrTimeout(sessionId: string, timeoutMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      conversationService.removeOutputCallback(sessionId, callback)
+      resolve()
+    }, timeoutMs)
+    const callback = (msg: any) => {
+      if (msg?.type !== 'result') return
+      clearTimeout(timeout)
+      conversationService.removeOutputCallback(sessionId, callback)
+      resolve()
+    }
+    conversationService.onOutput(sessionId, callback)
+  })
+}
+
+async function handlePlanApprovalWithRuntimeOverride(
+  ws: ServerWebSocket<WebSocketData>,
+  message: Extract<ClientMessage, { type: 'permission_response' }>,
+): Promise<void> {
+  const { sessionId } = ws.data
+  const normalized = await normalizeRuntimeOverrideInput(message.runtimeOverride!)
+  if (!normalized.ok) {
+    sendMessage(ws, {
+      type: 'error',
+      message:
+        normalized.reason === 'model'
+          ? 'Runtime model selection is invalid.'
+          : 'Runtime effort selection is invalid.',
+      code: 'RUNTIME_CONFIG_INVALID',
+    })
+    return
+  }
+  const nextOverride = normalized.override
+
+  const launchInfo = await sessionService.getSessionLaunchInfo(sessionId).catch(() => null)
+  const prevOverride = runtimeOverrides.get(sessionId)
+  const currentProviderId = prevOverride?.providerId ?? launchInfo?.runtimeProviderId ?? null
+  const currentModelId = prevOverride?.modelId ?? launchInfo?.runtimeModelId ?? undefined
+  const currentEffort = prevOverride?.effort ?? launchInfo?.effortLevel ?? undefined
+
+  if (
+    currentProviderId === nextOverride.providerId &&
+    currentModelId === nextOverride.modelId &&
+    currentEffort === nextOverride.effort
+  ) {
+    finalizePermissionResponse(ws, message)
+    return
+  }
+
+  const canSwitchInProcess =
+    conversationService.hasSession(sessionId) &&
+    currentProviderId === nextOverride.providerId &&
+    (nextOverride.effort === undefined || nextOverride.effort === currentEffort)
+
+  if (canSwitchInProcess) {
+    // Same provider: the CLI is blocked on this very permission request, so a
+    // set_model control request is acked before the allow response frees the
+    // turn — the first execution request is guaranteed to read the new model.
+    // On failure the transition rejects, the catch in handlePermissionResponse
+    // reports it, and the permission stays pending (override untouched).
+    await enqueueRuntimeTransition(sessionId, async () => {
+      await conversationService.setModel(sessionId, nextOverride.modelId)
+      runtimeOverrides.set(sessionId, nextOverride)
+      runtimeOverrideVersions.set(
+        sessionId,
+        (runtimeOverrideVersions.get(sessionId) ?? 0) + 1,
+      )
+      await persistSessionRuntimeConfig(sessionId, nextOverride)
+      broadcastAppliedRuntimeConfig(sessionId)
+    })
+    finalizePermissionResponse(ws, message)
+    return
+  }
+
+  // Cross-provider (or effort change): provider env is fixed at process spawn,
+  // so this automates the manual "approve → stop → switch model → continue"
+  // flow. The interrupted turn may bill one partial request to the planning
+  // model — same as the manual flow.
+  await enqueueRuntimeTransition(sessionId, async () => {
+    runtimeOverrides.set(sessionId, nextOverride)
+    runtimeOverrideVersions.set(
+      sessionId,
+      (runtimeOverrideVersions.get(sessionId) ?? 0) + 1,
+    )
+    await persistSessionRuntimeConfig(sessionId, nextOverride)
+    const approvedMode = extractSessionModeUpdate(message.permissionUpdates)
+    if (approvedMode) {
+      await persistSessionPermissionMode(sessionId, approvedMode)
+    }
+  })
+
+  finalizePermissionResponse(ws, message)
+  handleStopGeneration(ws)
+  // Let the CLI write the interrupted result before the restart kills the
+  // process. The timeout only bounds a wedged interrupt — the restart's own
+  // stopSession is the hard guarantee.
+  await waitForTurnResultOrTimeout(sessionId, 10_000)
+
+  let restarted = false
+  await enqueueRuntimeTransition(sessionId, async () => {
+    restarted = await restartSessionWithRuntimeConfig(ws, sessionId)
+  })
+  if (!restarted) return
+
+  const clients = activeSessions.get(sessionId)
+  const resumeWs = clients && clients.has(ws) ? ws : clients?.values().next().value
+  if (!resumeWs) return
+  const resumeTurn: ActiveUserTurnState = { messageSent: false }
+  void handleUserMessage(
+    resumeWs,
+    { type: 'user_message', content: PLAN_EXECUTION_CONTINUE_MESSAGE },
+    resumeTurn,
+  ).catch((err) => {
+    console.error(`[WS] Failed to auto-continue plan execution for ${sessionId}:`, err)
+  })
 }
 
 function handleComputerUsePermissionResponse(
@@ -1491,6 +1662,39 @@ async function applyPermissionModeToActiveSession(
   }
 }
 
+/**
+ * Shared normalization for runtime overrides arriving over WS
+ * (set_runtime_config and the plan-approval runtimeOverride): trims and
+ * validates the model id, applies the Grok catalog model fixup, and validates
+ * the requested effort against the provider's reasoning profile.
+ */
+async function normalizeRuntimeOverrideInput(
+  input: { providerId: string | null; modelId: string; effortLevel?: string },
+): Promise<
+  | { ok: true; override: RuntimeOverride }
+  | { ok: false; reason: 'model' | 'effort' }
+> {
+  let modelId = typeof input.modelId === 'string' ? input.modelId.trim() : ''
+  if (!modelId) return { ok: false, reason: 'model' }
+  if (isGrokOfficialProviderId(input.providerId)) {
+    modelId = (await getGrokReasoningEfforts(modelId)).modelId
+  }
+  const requestedEffort =
+    typeof input.effortLevel === 'string' ? input.effortLevel.trim() : undefined
+  const effortResolution = requestedEffort === undefined
+    ? { valid: true, effort: undefined }
+    : await resolveRuntimeEffort(input.providerId, modelId, requestedEffort)
+  if (!effortResolution.valid) return { ok: false, reason: 'effort' }
+  return {
+    ok: true,
+    override: {
+      providerId: input.providerId ?? null,
+      modelId,
+      ...(effortResolution.effort ? { effort: effortResolution.effort } : {}),
+    },
+  }
+}
+
 async function handleSetRuntimeConfig(
   ws: ServerWebSocket<WebSocketData>,
   message: Extract<ClientMessage, { type: 'set_runtime_config' }>
@@ -1505,34 +1709,25 @@ async function handleSetRuntimeConfig(
     })
     return
   }
-  const requestedEffort =
-    typeof message.effortLevel === 'string' ? message.effortLevel.trim() : undefined
 
   // Register the transition before remote model-catalog or provider validation.
   // A user message arriving in that async admission window must wait for the
   // selected runtime instead of entering the previous provider's CLI process.
   await enqueueRuntimeTransition(sessionId, async () => {
-    let modelId = requestedModelId
-    if (isGrokOfficialProviderId(message.providerId)) {
-      modelId = (await getGrokReasoningEfforts(modelId)).modelId
-    }
-    const effortResolution = requestedEffort === undefined
-      ? { valid: true, effort: undefined }
-      : await resolveRuntimeEffort(message.providerId, modelId, requestedEffort)
-    if (!effortResolution.valid) {
+    const normalized = await normalizeRuntimeOverrideInput(message)
+    if (!normalized.ok) {
       sendMessage(ws, {
         type: 'error',
-        message: 'Runtime effort selection is invalid.',
+        message:
+          normalized.reason === 'model'
+            ? 'Runtime model selection is invalid.'
+            : 'Runtime effort selection is invalid.',
         code: 'RUNTIME_CONFIG_INVALID',
       })
       return
     }
 
-    const nextOverride = {
-      providerId: message.providerId ?? null,
-      modelId,
-      ...(effortResolution.effort ? { effort: effortResolution.effort } : {}),
-    }
+    const nextOverride = normalized.override
     const prevOverride = runtimeOverrides.get(sessionId)
     if (
       prevOverride &&
@@ -1555,12 +1750,9 @@ async function handleSetRuntimeConfig(
       return
     }
 
-    if (conversationService.hasSession(sessionId)) {
-      await persistSessionRuntimeConfig(sessionId, nextOverride)
-      await restartSessionWithRuntimeConfig(ws, sessionId)
-      return
-    }
-
+    // A spawned process is already registered before its SDK startup settles.
+    // Wait for that startup before restarting, otherwise stopping it rejects
+    // the first turn that is still awaiting the same startup promise.
     const pendingStartup = sessionStartupPromises.get(sessionId)
     if (pendingStartup) {
       const startupRuntimeVersion = sessionStartupRuntimeVersions.get(sessionId) ?? 0
@@ -1583,6 +1775,12 @@ async function handleSetRuntimeConfig(
       ) {
         return
       }
+      await restartSessionWithRuntimeConfig(ws, sessionId)
+      return
+    }
+
+    if (conversationService.hasSession(sessionId)) {
+      await persistSessionRuntimeConfig(sessionId, nextOverride)
       await restartSessionWithRuntimeConfig(ws, sessionId)
       return
     }
@@ -1716,7 +1914,7 @@ async function resolveRuntimeRestartWorkDir(sessionId: string): Promise<string> 
 async function restartSessionWithRuntimeConfig(
   ws: ServerWebSocket<WebSocketData>,
   sessionId: string,
-): Promise<void> {
+): Promise<boolean> {
   try {
     const workDir = await resolveRuntimeRestartWorkDir(sessionId)
     markActiveAgentsStopping(sessionId)
@@ -1733,6 +1931,7 @@ async function restartSessionWithRuntimeConfig(
     broadcastAppliedRuntimeConfig(sessionId)
     sendMessage(ws, { type: 'status', state: 'idle' })
     console.log(`[WS] Restarted CLI for ${sessionId} with runtime override`)
+    return true
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
     void diagnosticsService.recordEvent({
@@ -1752,6 +1951,7 @@ async function restartSessionWithRuntimeConfig(
       code: 'CLI_RESTART_FAILED',
     })
     sendMessage(ws, { type: 'status', state: 'idle' })
+    return false
   }
 }
 
@@ -1883,22 +2083,45 @@ async function requestStopBackgroundTask(
   }
 
   try {
-    await conversationService.requestControl(sessionId, {
+    const response = await conversationService.requestControl(sessionId, {
       subtype: 'stop_task',
       task_id: taskId,
     })
-  } catch (error) {
-    if (isAlreadySettledTaskControlError(error)) {
-      untrackCliBackgroundTask(sessionId, taskId)
-      scheduleDisconnectedSessionCleanupIfIdle(sessionId)
+    if (response?.reason === 'not_found') {
+      convergeEvictedBackgroundTaskStop(sessionId, taskId)
     }
+  } catch (error) {
     reportBackgroundTaskStopFailure(sessionId, ws, taskId, error)
   }
 }
 
-function isAlreadySettledTaskControlError(error: unknown): boolean {
-  return error instanceof ConversationControlError &&
-    (error.code === 'not_found' || error.code === 'not_running')
+/**
+ * The CLI evicts a shell task the turn after it terminates (and a process
+ * restart clears the registry outright), so a Stop that lands late is
+ * answered with `not_found`. That is the stop's goal state, not a failure:
+ * drop the task from local tracking and send the terminal notification
+ * clients need to converge an entry they still show as running. Reporting
+ * `No task found with ID` here only re-arms the stop button for a task that
+ * can never be stopped again.
+ */
+function convergeEvictedBackgroundTaskStop(sessionId: string, taskId: string): void {
+  const tracked = activeNonAgentTasks.get(sessionId)?.get(taskId)
+  untrackCliBackgroundTask(sessionId, taskId)
+  const description = tracked?.description
+  sendToSession(sessionId, {
+    type: 'system_notification',
+    subtype: 'task_notification',
+    message: description ? `${description} stopped` : 'Background task stopped',
+    data: {
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: taskId,
+      tool_use_id: tracked?.toolUseId,
+      status: 'stopped',
+      summary: description ? `${description} stopped` : 'Background task stopped',
+      timestamp: new Date().toISOString(),
+    },
+  })
 }
 
 const AGENT_STOP_CONTROL_TIMEOUT_MS = 3_000
@@ -1956,11 +2179,7 @@ async function requestStopTrackedAgentTask(
 
   const latest = activeAgentTasks.get(sessionId)?.get(current.taskId)
   if (latest !== current) return
-  if (
-    controlError === undefined ||
-    !conversationService.hasSession(sessionId) ||
-    isAlreadySettledTaskControlError(controlError)
-  ) {
+  if (controlError === undefined || !conversationService.hasSession(sessionId)) {
     current.localStopConfirmed = true
   }
 
@@ -2045,12 +2264,6 @@ function reportBackgroundTaskStopFailure(
     type: 'background_task_stop_failed',
     taskId,
     message,
-    ...(error instanceof ConversationControlError &&
-        (error.code === 'not_found' ||
-          error.code === 'not_running' ||
-          error.code === 'unsupported_type')
-      ? { code: error.code }
-      : {}),
   }
   if (ws && activeSessions.get(sessionId)?.has(ws)) {
     sendMessage(ws, payload)
@@ -2441,6 +2654,7 @@ function triggerTitleGeneration(
         text,
         runtimeProviderId,
         titleLanguagePreference,
+        sessionId,
       )
       if (generationSeq !== state.generationSeq) return
       if (aiTitle) {
@@ -4690,6 +4904,10 @@ export function __resetWebSocketHandlerStateForTests(): void {
   interruptedSessionChats.clear()
   runtimeTransitionPromises.clear()
   sessionStartupPromises.clear()
+  runtimeOverrides.clear()
+  runtimeOverrideVersions.clear()
+  deferredRuntimeRestarts.clear()
+  deferredPermissionModes.clear()
 }
 
 export function __markPrewarmPendingForTests(sessionId: string): void {

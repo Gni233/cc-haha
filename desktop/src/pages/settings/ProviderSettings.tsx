@@ -19,6 +19,7 @@ import { Dropdown } from '@/components/ui/Dropdown'
 import { Tooltip } from '@/components/ui/Tooltip'
 import type { SavedProvider, UpdateProviderInput, ProviderTestResult, ModelMapping, Model1mSupport, ApiFormat, ProviderAuthStrategy, ProviderModelInfo, ProviderModelsErrorCode } from '../../types/provider'
 import { groupProviderModels, providerModelsErrorKey } from '../../lib/providerModels'
+import { resolveModelApiFormat } from '../../../../src/shared/modelApiFormats'
 import { apply1mSupportToContextInput, apply1mSupportToContextInputs, getAutoCompactWindowErrorKey, getModelContextWindowErrorKey, MODEL_SLOTS, parseAutoCompactWindowInput, parseModelContextWindowsInput, type ModelContextInputs, type ModelSlot } from '../../lib/providerModelContext'
 import type { ProviderPreset } from '../../types/providerPreset'
 import { normalizeProviderBaseUrl, presetMatchesBaseUrl, selectableProviderPresets } from '../../config/providerPresets'
@@ -356,7 +357,11 @@ export function ProviderSettings({ browserMode = false }: { browserMode?: boolea
                       {preset && preset.id !== 'custom' && (
                         <Badge tone="neutral">{preset.name}</Badge>
                       )}
-                      {provider.apiFormat && provider.apiFormat !== 'anthropic' && (
+                      {preset?.modelApiFormats?.length ? (
+                        // A path-bound gateway declares one format on the record but
+                        // routes per model, so the single-format badge would mislead.
+                        <Badge tone="warning">{t('settings.providers.multiProtocolBadge')}</Badge>
+                      ) : provider.apiFormat && provider.apiFormat !== 'anthropic' && (
                         <Badge tone="warning">
                           {provider.apiFormat === 'openai_chat' ? 'OpenAI Chat' : 'OpenAI Responses'}
                         </Badge>
@@ -1027,7 +1032,15 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
   const [selectedPreset, setSelectedPreset] = useState<ProviderPreset>(initialPreset)
   const [name, setName] = useState(provider?.name ?? initialPreset.name)
   const [baseUrl, setBaseUrl] = useState(provider?.baseUrl ?? initialPreset.baseUrl)
-  const [apiFormat, setApiFormat] = useState<ApiFormat>(provider?.apiFormat ?? initialPreset.apiFormat ?? 'anthropic')
+  // A preset that decides the protocol per model owns this field: the picked value
+  // is only the fallback for models no rule matches, so a record carrying a stale
+  // one (cc-switch import, a paste, an older save) must not override it.
+  const presetDrivesApiFormat = Boolean(selectedPreset.modelApiFormats?.length)
+  const [apiFormat, setApiFormat] = useState<ApiFormat>(
+    presetDrivesApiFormat
+      ? selectedPreset.apiFormat
+      : provider?.apiFormat ?? initialPreset.apiFormat ?? 'anthropic',
+  )
   const [authStrategy, setAuthStrategy] = useState<ProviderAuthStrategy>(provider?.authStrategy ?? getPresetAuthStrategy(initialPreset))
   const [apiKey, setApiKey] = useState(provider?.apiKey ?? '')
   const [showApiKey, setShowApiKey] = useState(false)
@@ -1486,13 +1499,28 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
   const modelsErrorUpstream = modelsErrorMessage && modelsErrorMessage !== modelsErrorText
     ? modelsErrorMessage
     : null
-  const modelPickerGroups = useMemo(
-    () => groupProviderModels(
-      fetchedModels ?? [],
-      t('settings.providers.fetchModelsGroupOther'),
-    ),
-    [fetchedModels, t],
-  )
+  // A path-bound gateway reports every model under one owner, so grouping by owner
+  // collapses the whole list into a single bucket. Group by the endpoint each model
+  // actually routes to instead: it is what distinguishes them, and it surfaces the
+  // otherwise invisible per-model routing where the user picks a model.
+  const modelPickerGroups = useMemo(() => {
+    const fallbackGroup = t('settings.providers.fetchModelsGroupOther')
+    const models = fetchedModels ?? []
+    const rules = selectedPreset.modelApiFormats
+    if (!rules?.length) return groupProviderModels(models, fallbackGroup)
+    const endpointByFormat: Record<ApiFormat, string> = {
+      anthropic: '/messages',
+      openai_chat: '/chat/completions',
+      openai_responses: '/responses',
+    }
+    return groupProviderModels(
+      models.map((model) => ({
+        ...model,
+        ownedBy: endpointByFormat[resolveModelApiFormat(rules, model.id) ?? selectedPreset.apiFormat],
+      })),
+      fallbackGroup,
+    )
+  }, [fetchedModels, selectedPreset, t])
   const renderPresetButton = (preset: ProviderPreset) => (
     <SettingsPill
       key={preset.id}
@@ -1621,6 +1649,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
           authStrategy,
           apiFormat,
           supportsNestedToolResultMedia,
+          presetId: selectedPreset.id,
           ...(apiFormat !== 'anthropic' ? { requestCompatibility: parseCompatibilityForm(compatibility) } : {}),
         })
       }
@@ -1713,7 +1742,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
         </div>
 
         {/* API Format */}
-        {(isCustom || mode === 'edit') ? (
+        {(isCustom || mode === 'edit') && !presetDrivesApiFormat ? (
           <div>
             <label className="text-sm font-medium text-[var(--color-text-primary)] mb-1 block">{t('settings.providers.apiFormat')}</label>
             <Dropdown<ApiFormat>
@@ -1733,12 +1762,15 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
               <p className="text-[11px] text-[var(--color-text-tertiary)] mt-1">{t('settings.providers.proxyHint')}</p>
             )}
           </div>
-        ) : apiFormat !== 'anthropic' ? (
+        ) : (presetDrivesApiFormat || apiFormat !== 'anthropic') ? (
           <div>
             <label className="text-sm font-medium text-[var(--color-text-primary)] mb-1 block">{t('settings.providers.apiFormat')}</label>
             <div className="text-xs text-[var(--color-text-tertiary)] px-3 py-2 rounded-[var(--radius-md)] bg-[var(--color-surface-container-low)] border border-[var(--color-border)]">
-              {apiFormat === 'openai_chat' ? t('settings.providers.apiFormatOpenaiChat') : t('settings.providers.apiFormatOpenaiResponses')}
+              {selectedApiFormatLabel}
             </div>
+            {presetDrivesApiFormat && (
+              <p className="text-[11px] text-[var(--color-text-tertiary)] mt-1">{t('settings.providers.apiFormatPerModelHint')}</p>
+            )}
           </div>
         ) : null}
 

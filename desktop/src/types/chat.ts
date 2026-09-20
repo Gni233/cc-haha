@@ -17,6 +17,8 @@ export type ClientMessage =
       updatedInput?: Record<string, unknown>
       denyMessage?: string
       permissionUpdates?: PermissionUpdate[]
+      // Execution-model switch applied together with an ExitPlanMode approval.
+      runtimeOverride?: RuntimeSelection
     }
   | {
       type: 'computer_use_permission_response'
@@ -152,12 +154,7 @@ export type ServerMessage =
   // 流式请求失败后的恢复状态：可能安全重试流，也可能降级为非流式请求。
   | { type: 'streaming_fallback'; cause: StreamingFallbackCause }
   | { type: 'error'; message: string; code: string; retryable?: boolean; businessErrorCode?: string }
-  | {
-      type: 'background_task_stop_failed'
-      taskId: string
-      message: string
-      code?: 'not_found' | 'not_running' | 'unsupported_type'
-    }
+  | { type: 'background_task_stop_failed'; taskId: string; message: string }
   | { type: 'system_notification'; subtype: string; message?: string; data?: unknown }
   | { type: 'pong' }
   | { type: 'team_update'; teamName: string; members: TeamMemberStatus[]; incarnationId?: string; leadSessionId?: string; createdAt?: number }

@@ -121,6 +121,12 @@ vi.mock('@/components/composite/DirectoryPicker', () => ({
   ),
 }))
 
+// The launch controls' project editor is out of scope here; its folder field
+// would pull the mocked picker module back in.
+vi.mock('@/components/layout/ProjectEditorModal', () => ({
+  ProjectEditorModal: () => null,
+}))
+
 vi.mock('../components/controls/PermissionModeSelector', () => ({
   PermissionModeSelector: ({ compact, value, onChange }: { compact?: boolean; value?: string; onChange?: (mode: string) => void }) => (
     <button
@@ -546,6 +552,17 @@ describe('EmptySession', () => {
     expect(mocks.wsSend).not.toHaveBeenCalled()
     expect(await screen.findByTestId('model-selector-dropdown')).toHaveTextContent('Model selector opened')
     expect(getComposerText()).toBe('')
+  })
+
+  // Same guard as the ChatInput hero test: this flex row is what the new-tab
+  // page renders, and an unbreakable run (long URL, hash) would otherwise
+  // grow the composer past the panel border.
+  it('keeps min-w-0 on the composer wrapper so unbreakable runs cannot widen it', () => {
+    render(<EmptySession />)
+
+    const wrapper = getComposerElement().parentElement
+    expect(wrapper).toHaveClass('flex-1')
+    expect(wrapper).toHaveClass('min-w-0')
   })
 
   it('shows /save-workflow help without creating or sending a session', async () => {

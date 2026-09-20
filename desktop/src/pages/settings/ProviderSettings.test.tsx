@@ -266,3 +266,125 @@ describe('provider request compatibility', () => {
     expect(dialog.queryByRole('textbox', { name: 'Reply output budget' })).not.toBeInTheDocument()
   })
 })
+
+/**
+ * OpenCode Go is the first provider whose wire format depends on the model rather
+ * than the record, so what the user has to do — and what they must not have to do
+ * — is part of the contract, not just cosmetics.
+ */
+describe('OpenCode Go provider', () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ locale: 'en' })
+    vi.spyOn(useSettingsStore.getState(), 'fetchAll').mockResolvedValue()
+    vi.spyOn(providersApi, 'list').mockResolvedValue({ providers: [], activeId: null })
+    vi.spyOn(providersApi, 'getSettings').mockResolvedValue({})
+    vi.spyOn(providersApi, 'updateSettings').mockResolvedValue({ ok: true })
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('is added with an API key alone, because the preset carries everything else', async () => {
+    const create = vi.spyOn(providersApi, 'create').mockImplementation(async (input) => ({
+      provider: { ...input, id: 'saved-opencode-go', apiFormat: input.apiFormat ?? 'anthropic' },
+    }))
+    render(<ProviderSettings />)
+    fireEvent.click(await screen.findByRole('button', { name: /Add Model/ }))
+    const dialog = within(screen.getByRole('dialog'))
+    fireEvent.click(dialog.getByRole('button', { name: 'OpenCode Go' }))
+
+    expect(dialog.getByDisplayValue('https://opencode.ai/zen/go/v1')).toBeInTheDocument()
+    expect(dialog.getAllByDisplayValue('glm-5.3')).toHaveLength(3)
+    expect(dialog.getByDisplayValue('glm-5.3-flash')).toBeInTheDocument()
+
+    fireEvent.change(dialog.getAllByPlaceholderText('sk-...')[0]!, { target: { value: 'fake-opencode-key' } })
+    fireEvent.click(dialog.getByRole('button', { name: 'Add' }))
+    await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      presetId: 'opencode-go',
+      baseUrl: 'https://opencode.ai/zen/go/v1',
+      apiFormat: 'openai_chat',
+      authStrategy: 'api_key',
+      apiKey: 'fake-opencode-key',
+      models: { main: 'glm-5.3', haiku: 'glm-5.3-flash', sonnet: 'glm-5.3', opus: 'glm-5.3' },
+    })))
+  })
+
+  it('groups the fetched catalogue by the endpoint each model is served on', async () => {
+    vi.spyOn(providersApi, 'fetchModels').mockResolvedValue({
+      ok: true,
+      endpoint: 'https://opencode.ai/zen/go/v1/models',
+      // Every model reports the same owner, so grouping by it would be useless.
+      models: [
+        { id: 'glm-5.3', ownedBy: 'opencode' },
+        { id: 'minimax-m3', ownedBy: 'opencode' },
+        { id: 'grok-4.6', ownedBy: 'opencode' },
+      ],
+    })
+    render(<ProviderSettings />)
+    fireEvent.click(await screen.findByRole('button', { name: /Add Model/ }))
+    const dialog = within(screen.getByRole('dialog'))
+    fireEvent.click(dialog.getByRole('button', { name: 'OpenCode Go' }))
+    fireEvent.change(dialog.getAllByPlaceholderText('sk-...')[0]!, { target: { value: 'fake-opencode-key' } })
+    fireEvent.click(dialog.getByRole('button', { name: /Fetch models/ }))
+
+    const combobox = await dialog.findByRole('combobox', { name: /Main Model/ })
+    fireEvent.focus(combobox)
+
+    // The endpoint is the only thing that distinguishes these models, so it is what
+    // the picker groups by — this is how the routing stays visible while choosing.
+    for (const endpoint of ['/chat/completions', '/messages', '/responses']) {
+      expect(await screen.findByText(endpoint)).toBeInTheDocument()
+    }
+  })
+
+  it('badges the provider as multi-protocol instead of naming one format', async () => {
+    vi.mocked(providersApi.list).mockResolvedValue({ providers: [{
+      id: 'saved-opencode-go',
+      presetId: 'opencode-go',
+      name: 'OpenCode Go',
+      baseUrl: 'https://opencode.ai/zen/go/v1',
+      apiKey: 'fake-opencode-key',
+      apiFormat: 'openai_chat',
+      models: { main: 'glm-5.3', haiku: 'glm-5.3-flash', sonnet: 'glm-5.3', opus: 'glm-5.3' },
+    }], activeId: null })
+    render(<ProviderSettings />)
+    const card = await screen.findByTestId('provider-saved-opencode-go')
+    expect(within(card).getByText('Multi-protocol')).toBeInTheDocument()
+    expect(within(card).queryByText('OpenAI Chat')).not.toBeInTheDocument()
+  })
+
+  it('shows the preset-owned format as fixed instead of offering a choice that is ignored', async () => {
+    render(<ProviderSettings />)
+    fireEvent.click(await screen.findByRole('button', { name: /Add Model/ }))
+    const dialog = within(screen.getByRole('dialog'))
+    fireEvent.click(dialog.getByRole('button', { name: 'OpenCode Go' }))
+
+    expect(dialog.getByText('OpenAI Chat Completions (proxy)')).toBeInTheDocument()
+    expect(dialog.getByText(/picks the protocol per model/)).toBeInTheDocument()
+    // A record-level format cannot express the per-model split, so the server
+    // ignores it; leaving a dropdown here would offer a switch that does nothing.
+    expect(dialog.queryByRole('button', { name: /OpenAI Chat Completions \(proxy\)|Anthropic Messages/ })).toBeNull()
+  })
+
+  it('sends the preset id with a connectivity test so the server resolves the same protocol', async () => {
+    const testConfig = vi.spyOn(useProviderStore.getState(), 'testConfig').mockResolvedValue({
+      connectivity: { success: true, latencyMs: 1 },
+    })
+    render(<ProviderSettings />)
+    fireEvent.click(await screen.findByRole('button', { name: /Add Model/ }))
+    const dialog = within(screen.getByRole('dialog'))
+    fireEvent.click(dialog.getByRole('button', { name: 'OpenCode Go' }))
+    fireEvent.change(dialog.getAllByPlaceholderText('sk-...')[0]!, { target: { value: 'fake-opencode-key' } })
+    fireEvent.click(dialog.getByRole('button', { name: /Test Connection/ }))
+
+    await waitFor(() => expect(testConfig).toHaveBeenCalledWith(expect.objectContaining({
+      // Without this the probe would try every model on the record's single format
+      // and report a false failure for anything that routes elsewhere.
+      presetId: 'opencode-go',
+      modelId: 'glm-5.3',
+    })))
+  })
+
+})
